@@ -7,6 +7,7 @@
   "exports": { ".": "./index.mjs", "./client": "./client.js", "./locale/*.json": "./locale/*.json", "./icon": "./icon.svg" },
   "files": ["index.mjs", "discover.mjs", "client.js", "cordis.patch.yml", "locale/*.json", "icon.svg", "README.md"],
   "engines": { "dsh": ">=0.2.2-rc.5 <0.3.0" },
+  "scripts": { "test": "node discover.test.mjs && node host.test.mjs && node client.test.mjs" },
   "dsh": {
     "bundle": { "patch": "./cordis.patch.yml" },
     "client": {
