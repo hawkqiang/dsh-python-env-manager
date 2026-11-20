@@ -1,0 +1,5 @@
+- insert:
+    - id: local-python-env-manager
+      name: '@local/python-env-manager'
+      config:
+        selectedPath: ''
