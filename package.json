@@ -2,7 +2,7 @@
   "name": "@local/python-env-manager",
   "version": "1.0.0",
   "private": true,
-  "description": "Discover local Python interpreters and remember a profile-wide interpreter for sandboxed agent tasks.",
+  "description": "Pick a Python interpreter per conversation from the DSH input toolbar; the conversation and its subagents run Python with it, without changing system PATH.",
   "type": "module",
   "exports": { ".": "./index.mjs", "./client": "./client.js", "./locale/*.json": "./locale/*.json", "./icon": "./icon.svg" },
   "files": ["index.mjs", "discover.mjs", "client.js", "cordis.patch.yml", "locale/*.json", "icon.svg", "README.md"],
