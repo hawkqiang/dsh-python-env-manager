@@ -4,8 +4,19 @@ import { readFileSync } from 'node:fs'
 import { mkdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { discover } from './discover.mjs'
+import {
+  buildSshArgv,
+  isSshSelection,
+  parseSshConfig,
+  parseSshUri,
+  probeHostPythons,
+  serializeSshUri,
+  shellQuote,
+  sshEnvironmentRows,
+  sshHostLabel,
+} from './ssh.mjs'
 
-export const inject = ['tools', 'systemPrompt', 'shellEnv', 'workingDirectory', 'sandboxPolicy', 'subprocess']
+export const inject = ['tools', 'systemPrompt', 'shellEnv', 'workingDirectory', 'sandboxPolicy', 'subprocess', 'webServer']
 
 export const API_PREFIX = '/python-env/api'
 export const DEFAULT_STATE_FILE = path.join(homedir(), '.dsh', 'python-env-manager', 'state.json')
@@ -17,6 +28,27 @@ const interpreterBasename = /^python(\d+(?:\.\d+)?)?(\.exe)?$/i
 const sessionIdPattern = /^[^\s\u0000-\u001f]{1,200}$/
 const isWindows = process.platform === 'win32'
 const pathKey = value => (isWindows ? value.toLowerCase() : value)
+
+/**
+ * Identity key for a selection: ssh URIs compare verbatim (path.normalize
+ * would mangle them into Windows backslash paths), local paths compare
+ * case-insensitively and normalized on Windows.
+ */
+function selectionKey(value) {
+  return isSshSelection(value) ? value.trim().toLowerCase() : pathKey(path.normalize(value))
+}
+
+/**
+ * Test-only override of the home directory used for ~/.ssh/config discovery,
+ * mirroring the state-file override; DSH itself never sets it.
+ */
+function sshHome() {
+  const override = process.env.DSH_PYTHON_ENV_MANAGER_HOME
+  if (typeof override === 'string' && override.trim() !== '' && path.isAbsolute(override.trim())) {
+    return path.normalize(override.trim())
+  }
+  return homedir()
+}
 
 /**
  * The state path is fixed for production. The environment override exists only
@@ -40,12 +72,19 @@ export function validateSessionId(value) {
 }
 
 /**
- * Atomic JSON file holding `{ version: 2, sessions: { [sessionId]: interpreter } }`.
- * The legacy `{ selectedPath }` shape is deliberately ignored: there is no
- * profile-wide fallback, so every conversation must make its own selection.
+ * Atomic JSON file holding `{ version: 2, sessions: { [sessionId]: interpreter } }`
+ * where the interpreter is either an absolute local path or an
+ * `ssh://[user@]host[:port]/abs/python-path` URI. The legacy `{ selectedPath }`
+ * shape is deliberately ignored: there is no profile-wide fallback, so every
+ * conversation must make its own selection.
  */
 export function createStore(file = stateFile()) {
   const sessions = new Map()
+
+  const isValidSelection = value =>
+    typeof value === 'string' && value.trim() !== '' && (isSshSelection(value) || path.isAbsolute(value))
+  const normalizeSelection = value =>
+    isSshSelection(value) ? value.trim() : path.normalize(value)
 
   const pick = parsed => {
     const next = new Map()
@@ -54,8 +93,8 @@ export function createStore(file = stateFile()) {
     const raw = parsed.sessions
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return next
     for (const [sessionId, value] of Object.entries(raw)) {
-      if (typeof value !== 'string' || !path.isAbsolute(value) || !sessionIdPattern.test(sessionId)) continue
-      next.set(sessionId, path.normalize(value))
+      if (!isValidSelection(value) || !sessionIdPattern.test(sessionId)) continue
+      next.set(sessionId, normalizeSelection(value))
     }
     return next
   }
@@ -115,10 +154,10 @@ export function createStore(file = stateFile()) {
     },
     async set(sessionId, interpreter) {
       validateSessionId(sessionId)
-      if (typeof interpreter !== 'string' || !path.isAbsolute(interpreter)) {
-        throw new Error('Python 解释器必须是绝对路径。')
+      if (!isValidSelection(interpreter)) {
+        throw new Error('Python 解释器必须是绝对路径或 ssh:// 远程解释器。')
       }
-      sessions.set(sessionId, path.normalize(interpreter))
+      sessions.set(sessionId, normalizeSelection(interpreter))
       await persist()
       return sessions.get(sessionId)
     },
@@ -132,6 +171,9 @@ export function createStore(file = stateFile()) {
 }
 
 async function interpreterAvailability(value) {
+  // A remote interpreter cannot be stat()ed locally; reachability is checked
+  // when it actually runs (ssh failures surface with their own message).
+  if (isSshSelection(value)) return null
   try {
     const info = await stat(value)
     return info.isFile() ? null : 'not-a-file'
@@ -140,10 +182,20 @@ async function interpreterAvailability(value) {
   }
 }
 
-/** Absolute path + existing file + basename `python`/`python.exe`; returns normalized path. */
+/** Validate an ssh:// interpreter URI and return its canonical form. */
+async function validateSshInterpreter(value) {
+  const parsed = parseSshUri(value)
+  if (!parsed) {
+    throw new Error('SSH 解释器路径无效：应为 ssh://[user@]host[:port]/绝对路径/python3 形式，且以 python/python3 结尾。')
+  }
+  return serializeSshUri(parsed)
+}
+
+/** Absolute path or ssh:// URI + existing file + python basename; normalized. */
 export async function validateInterpreterPath(value) {
   const text = typeof value === 'string' ? value.trim() : ''
-  if (text === '' || !path.isAbsolute(text)) throw new Error('Python 解释器必须是绝对路径。')
+  if (isSshSelection(text)) return validateSshInterpreter(text)
+  if (text === '' || !path.isAbsolute(text)) throw new Error('Python 解释器必须是绝对路径或 ssh:// 远程解释器。')
   const normalized = path.normalize(text)
   if (!interpreterBasename.test(path.basename(normalized))) {
     throw new Error('路径的文件名必须为 python、python3 或 python.exe。')
@@ -200,6 +252,18 @@ async function environmentsIn(cwd) {
 
 /** Descriptor used when a validated interpreter is not present in discovery. */
 function manualEnvironment(interpreter) {
+  if (isSshSelection(interpreter)) {
+    const parsed = parseSshUri(interpreter)
+    if (!parsed) {
+      return { name: interpreter, prefix: interpreter, path: interpreter, source: 'ssh' }
+    }
+    return {
+      name: sshHostLabel(parsed),
+      prefix: `ssh://${parsed.user ? `${parsed.user}@` : ''}${parsed.host}`,
+      path: serializeSshUri(parsed),
+      source: 'ssh',
+    }
+  }
   const dir = path.dirname(interpreter)
   const tail = path.basename(dir).toLowerCase()
   const prefix = tail === 'scripts' || tail === 'bin' ? path.dirname(dir) : dir
@@ -207,8 +271,8 @@ function manualEnvironment(interpreter) {
 }
 
 function findEnvironment(rows, interpreter) {
-  const key = pathKey(interpreter)
-  return rows.find(row => pathKey(path.normalize(row.path)) === key)
+  const key = selectionKey(interpreter)
+  return rows.find(row => selectionKey(row.path) === key)
 }
 
 function sendJson(res, status, body) {
@@ -280,14 +344,125 @@ const NO_SELECTION = '本对话尚未选择默认 Python 解释器。请在输�
 export function apply(ctx, config = {}) {
   const store = createStore()
 
+  /*
+   * SSH remote environments. Probes run through ctx.subprocess.spawn with
+   * BatchMode-only ssh (never hangs on a password prompt), are cached for one
+   * minute, and are triggered by the panel (/ssh, /refresh) or the manager
+   * tool's list action — never eagerly at startup.
+   */
+  const SSH_PROBE_TIMEOUT = 10_000
+  const SSH_CACHE_TTL = 60_000
+  const sshCache = {
+    status: 'idle', // idle | unconfigured | probing | ready | empty | error | unavailable
+    environments: [],
+    probedAt: 0,
+    promise: null,
+  }
+
+  const sshSnapshot = () => ({ status: sshCache.status, environments: sshCache.environments })
+
+  async function runSsh(argv, timeoutMs = SSH_PROBE_TIMEOUT) {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    try {
+      const handle = ctx.subprocess.spawn({
+        argv,
+        cwd: ctx.workingDirectory.defaultDirectory,
+        stdio: {
+          stdin: 'ignore',
+          stdout: { maxBytes: 256 * 1024 },
+          stderr: { maxBytes: 64 * 1024 },
+        },
+        graceMs: 1000,
+        signal: controller.signal,
+      })
+      const outcome = await handle.done
+      const stdout = readCollected(handle, 'stdout')
+      const stderr = readCollected(handle, 'stderr')
+      return { exitCode: outcome?.exitCode ?? -1, signal: outcome?.signal ?? null, stdout: stdout.text, stderr: stderr.text }
+    } catch (error) {
+      if (controller.signal.aborted) return { exitCode: -1, signal: 'timeout', stdout: '', stderr: '' }
+      const spawnError = new Error(`无法启动 ssh 客户端：${String(error?.message ?? error)}`)
+      spawnError.spawnFailed = true
+      throw spawnError
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  async function probeSshHosts() {
+    let hosts = []
+    try {
+      hosts = await parseSshConfig({ home: sshHome() })
+    } catch {
+      hosts = []
+    }
+    if (hosts.length === 0) {
+      sshCache.status = 'unconfigured'
+      sshCache.environments = []
+      sshCache.probedAt = Date.now()
+      return
+    }
+    hosts = hosts.slice(0, 16)
+    const outcomes = await Promise.all(hosts.map(async host => {
+      try {
+        const result = await probeHostPythons(host, argv => runSsh(argv))
+        return { host, result }
+      } catch (error) {
+        return { host, result: { ok: false, reason: error?.spawnFailed ? 'spawn-failed' : 'error' } }
+      }
+    }))
+    if (outcomes.every(entry => entry.result.reason === 'spawn-failed')) {
+      sshCache.status = 'unavailable'
+      sshCache.environments = []
+      sshCache.probedAt = Date.now()
+      return
+    }
+    const reachable = outcomes.filter(entry => entry.result.ok)
+    if (reachable.length === 0) {
+      sshCache.status = 'error'
+      sshCache.environments = []
+      sshCache.probedAt = Date.now()
+      return
+    }
+    const rows = reachable.flatMap(entry => sshEnvironmentRows(entry.host, entry.result.interpreterPaths))
+    sshCache.status = rows.length > 0 ? 'ready' : 'empty'
+    sshCache.environments = rows
+    sshCache.probedAt = Date.now()
+  }
+
+  /** Probe when forced, expired, or never probed; concurrent callers share one run. */
+  async function probeSsh({ force = false } = {}) {
+    const expired = Date.now() - sshCache.probedAt >= SSH_CACHE_TTL
+    if (!force && sshCache.promise && sshCache.status !== 'idle') return sshSnapshot()
+    if (!force && sshCache.status !== 'idle' && !expired) return sshSnapshot()
+    if (sshCache.status === 'unconfigured' && !force) return sshSnapshot()
+    if (!sshCache.promise || force) {
+      sshCache.promise = probeSshHosts().finally(() => {
+        sshCache.promise = null
+      })
+    }
+    await sshCache.promise
+    return sshSnapshot()
+  }
+
+  /** Non-blocking: used by GET /state so the panel paints local rows first. */
+  function probeSshInBackground() {
+    if (sshCache.status === 'idle' && !sshCache.promise) {
+      sshCache.promise = probeSshHosts().finally(() => {
+        sshCache.promise = null
+      })
+    }
+  }
+
   ctx.effect(() => ctx.tools.register({
     name: 'python_env_manager',
-    description: 'List local Python candidates, select or clear the Python interpreter for this conversation (including its subagents), or resolve that interpreter for a sandboxed shell. The selection applies only to the current conversation and its subagents; it does not affect other conversations, and a conversation without a selection never inherits another one or the system Python. The selection is stored per session in ~/.dsh/python-env-manager/state.json. On ambiguous names, show matching environments and ask which one; never guess. Report that the change affects this conversation only, not the system or other terminals. Does not execute Python; use python_env_run to execute the selected interpreter.',
+    description: 'List local Python candidates plus optional SSH remote interpreters (probed from ~/.ssh/config hosts), select or clear the Python interpreter for this conversation (including its subagents), or resolve that interpreter for a sandboxed shell. A selection may be an absolute local path or an ssh://[user@]host/path URI reported in the list. The selection applies only to the current conversation and its subagents; it does not affect other conversations, and a conversation without a selection never inherits another one or the system Python. The selection is stored per session in ~/.dsh/python-env-manager/state.json. On ambiguous names, show matching environments and ask which one; never guess. Report that the change affects this conversation only, not the system or other terminals. Does not execute Python; use python_env_run to execute the selected interpreter.',
     parameters: {
       type: 'object',
       properties: {
         action: { type: 'string', enum: actions },
-        path: { type: 'string', description: 'select only: exact absolute path of the interpreter to select.' },
+        path: { type: 'string', description: 'select only: exact absolute local path or ssh:// URI from the list.' },
         offset: { type: 'integer', description: 'list only: zero-based offset (default 0).' },
       },
       required: ['action'],
@@ -314,16 +489,18 @@ export function apply(ctx, config = {}) {
         : ctx.workingDirectory.defaultDirectory
       const rows = await environmentsIn(cwd)
       if (action === 'list') {
+        const ssh = await probeSsh()
         const selected = store.get(sessionId)
         const start = offset ?? 0
         const end = start + pageSize
         return {
           sessionId,
           selected,
-          selectedAvailable: !!selected && rows.some(row => pathKey(row.path) === pathKey(selected)),
+          selectedAvailable: !!selected && rows.some(row => selectionKey(row.path) === selectionKey(selected)),
           total: rows.length,
           environments: rows.slice(start, end),
           nextOffset: end < rows.length ? end : null,
+          ssh,
         }
       }
       if (action === 'select') {
@@ -350,7 +527,7 @@ export function apply(ctx, config = {}) {
 
   ctx.effect(() => ctx.tools.register({
     name: 'python_env_run',
-    description: 'Default execution entry point for the Python interpreter selected in this conversation\'s DSH toolbar; subagents use the interpreter of the conversation they belong to. This is not a shell: every argv entry is passed literally to the interpreter as one argument, with no shell expansion, quoting, pipes, redirection, globbing, or environment activation. Runs are subject to the session sandbox and permission policy, and this tool never changes PATH or bypasses the sandbox. Do not use it to install software or activate environments. If this conversation has no selected interpreter, it fails instead of inheriting another conversation\'s choice or substituting the system Python.',
+    description: 'Default execution entry point for the Python interpreter selected in this conversation\'s DSH toolbar; subagents use the interpreter of the conversation they belong to. For an ssh:// selection the command runs that remote interpreter over ssh with arguments quoted for the remote shell. This is not a shell: every argv entry is passed literally to the interpreter as one argument, with no local shell expansion, quoting, pipes, redirection, globbing, or environment activation. Runs are subject to the session sandbox and permission policy, and this tool never changes PATH or bypasses the sandbox. Do not use it to install software or activate environments. If this conversation has no selected interpreter, it fails instead of inheriting another conversation\'s choice or substituting the system Python.',
     parameters: {
       type: 'object',
       properties: {
@@ -410,7 +587,20 @@ export function apply(ctx, config = {}) {
 
       const session = exec?.agent?.session
       const policy = ctx.sandboxPolicy.resolve(session ? { session } : {})
-      const baseArgv = [interpreter, ...argv]
+      // ssh:// selection → run the remote interpreter over ssh; every argument
+      // is quoted for the remote shell so the argv stays literal end to end.
+      const remote = isSshSelection(interpreter) ? parseSshUri(interpreter) : null
+      if (remote === null && isSshSelection(interpreter)) {
+        throw new Error(`所选 SSH 解释器无效（无法解析）：${interpreter}。请在该对话中重新选择。`)
+      }
+      const baseArgv = remote
+        ? buildSshArgv({
+            user: remote.user,
+            host: remote.host,
+            port: remote.port,
+            command: [remote.path, ...argv].map(shellQuote).join(' '),
+          })
+        : [interpreter, ...argv]
       let spawnArgv = baseArgv
       if (policy.mode !== 'danger-full-access') {
         const sandbox = ctx.get('sandbox')
@@ -469,7 +659,8 @@ export function apply(ctx, config = {}) {
 
       const stdout = readCollected(handle, 'stdout')
       const stderr = readCollected(handle, 'stderr')
-      const environment = findEnvironment(await environmentsIn(sessionCwd).catch(() => []), interpreter) ??
+      const localRows = await environmentsIn(sessionCwd).catch(() => [])
+      const environment = findEnvironment([...localRows, ...sshCache.environments], interpreter) ??
         manualEnvironment(interpreter)
       const spillPaths = [stdout.spillPath, stderr.spillPath].filter(item => typeof item === 'string')
       const result = {
@@ -492,14 +683,14 @@ export function apply(ctx, config = {}) {
   ctx.effect(() => ctx.systemPrompt.section({
     name: 'python-env-manager',
     order: 700,
-    text: 'Python interpreters are selected per conversation: each conversation and its subagents share one selection, and no conversation inherits another conversation\'s selection or the system Python. Every Python task (including subagents) must run through the python_env_run tool instead of a bare python/python3 or the system interpreter. If this conversation has no selected interpreter, ask the user to choose one from that conversation\'s input-toolbar picker instead of using the system python; do not change PATH. python_env_run passes arguments literally and is still constrained by the session sandbox and permissions. Do not change PATH or elevate permissions. If the selected interpreter is missing or unavailable, report the failure instead of substituting another Python. Use python_env_run to execute Python code only, not to install software or activate environments.',
+    text: 'Python interpreters are selected per conversation: each conversation and its subagents share one selection, and no conversation inherits another conversation\'s selection or the system Python. Every Python task (including subagents) must run through the python_env_run tool instead of a bare python/python3 or the system interpreter. If this conversation has no selected interpreter, ask the user to choose one from that conversation\'s input-toolbar picker instead of using the system python; do not change PATH. python_env_run passes arguments literally and is still constrained by the session sandbox and permissions. A selection may be an ssh://[user@]host/path URI from the picker; python_env_run then executes that remote interpreter over ssh with every argument quoted for the remote shell (remote cwd is the login home). Do not change PATH or elevate permissions. If the selected interpreter is missing or unavailable, report the failure instead of substituting another Python. Use python_env_run to execute Python code only, not to install software or activate environments.',
   }))
 
   ctx.effect(() => ctx.shellEnv.register({
     name: 'python-env-manager',
     variables: {
       DSH_PYTHON: {
-        description: 'Absolute path of the interpreter selected for this conversation (subagents follow their root conversation); use only in an already-permitted sandboxed shell, without changing PATH or activating environments.',
+        description: 'Absolute local path or ssh:// URI of the interpreter selected for this conversation (subagents follow their root conversation); use only in an already-permitted sandboxed shell, without changing PATH or activating environments.',
       },
     },
     resolve: execution => {
@@ -516,11 +707,14 @@ export function apply(ctx, config = {}) {
 
   const stateFor = async sessionId => {
     await store.load()
+    const sshFresh = sshCache.status !== 'idle' || sshCache.promise
+    if (!sshFresh) probeSshInBackground()
     return {
       ok: true,
       sessionId,
       selected: store.get(sessionId),
       environments: await environmentsIn(ctx.workingDirectory.defaultDirectory),
+      ssh: sshCache.status === 'idle' ? { status: 'probing', environments: [] } : sshSnapshot(),
     }
   }
 
@@ -544,7 +738,7 @@ export function apply(ctx, config = {}) {
       let rest = url.pathname.slice(API_PREFIX.length)
       if (rest.length > 1 && rest.endsWith('/')) rest = rest.slice(0, -1)
 
-      const expected = { '/state': 'GET', '/select': 'POST', '/clear': 'POST', '/refresh': 'POST' }
+      const expected = { '/state': 'GET', '/select': 'POST', '/clear': 'POST', '/refresh': 'POST', '/ssh': 'GET' }
       if (!Object.prototype.hasOwnProperty.call(expected, rest)) {
         return sendJson(res, 404, { ok: false, error: `unknown route "${rest}"` })
       }
@@ -560,6 +754,14 @@ export function apply(ctx, config = {}) {
         }
       }
 
+      if (rest === '/ssh') {
+        const { sessionId, error } = sessionFrom(url.searchParams.get('sessionId'))
+        if (error) return sendJson(res, 400, { ok: false, error })
+        const force = url.searchParams.get('force') === '1'
+        const ssh = await probeSsh({ force })
+        return sendJson(res, 200, { ok: true, sessionId, ssh })
+      }
+
       if (rest === '/state' || rest === '/refresh') {
         let body = null
         if (rest === '/refresh') {
@@ -571,6 +773,11 @@ export function apply(ctx, config = {}) {
           : url.searchParams.get('sessionId')
         const { sessionId, error } = sessionFrom(raw)
         if (error) return sendJson(res, 400, { ok: false, error })
+        if (rest === '/refresh') {
+          // Refresh covers both layers: local discovery re-runs in stateFor,
+          // and SSH hosts are re-probed (bounded by the probe timeouts).
+          await probeSsh({ force: true }).catch(() => {})
+        }
         return sendJson(res, 200, await stateFor(sessionId))
       }
 
@@ -587,7 +794,8 @@ export function apply(ctx, config = {}) {
         }
         await store.load()
         const rows = await environmentsIn(ctx.workingDirectory.defaultDirectory)
-        const environment = findEnvironment(rows, interpreter) ?? manualEnvironment(interpreter)
+        const environment = findEnvironment([...rows, ...sshCache.environments], interpreter) ??
+          manualEnvironment(interpreter)
         await store.set(sessionId, interpreter)
         return sendJson(res, 200, { ok: true, sessionId, selected: interpreter, environment })
       }
@@ -605,7 +813,10 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  const webServer = ctx.get('webServer')
+  // DSH only exposes webServer to plugins that declare it in `inject`, so the
+  // toolbar panel gets its routes. Keep the guard for hosts without a web
+  // surface (headless), where the tools still work without the HTTP API.
+  const webServer = ctx.webServer ?? ctx.get('webServer')
   if (webServer && typeof webServer.register === 'function') {
     ctx.effect(() => webServer.register({ kind: 'prefix', path: API_PREFIX, handler }))
   }

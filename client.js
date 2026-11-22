@@ -33,6 +33,7 @@ window.__ModuleLoader__.load({
     const NS = 'python-env-manager'
     const API_BASE = '/python-env/api'
     const REQUEST_TIMEOUT = 8000
+    const SSH_TIMEOUT = 15000
 
     const DICT = {
       en: {
@@ -57,6 +58,12 @@ window.__ModuleLoader__.load({
         timeout: 'The request timed out.',
         selectedNotice: 'Default set: {name}',
         clearedNotice: 'Default selection cleared',
+        sshGroup: 'SSH remote',
+        sshProbing: 'Probing SSH hosts…',
+        sshUnconfigured: 'No hosts configured in ~/.ssh/config',
+        sshEmpty: 'SSH hosts reachable, but no Python found',
+        sshError: 'SSH hosts unreachable or probing failed',
+        sshUnavailable: 'No usable ssh client on this machine',
       },
       zh: {
         title: 'Python 环境',
@@ -80,6 +87,12 @@ window.__ModuleLoader__.load({
         timeout: '请求超时。',
         selectedNotice: '已设为默认：{name}',
         clearedNotice: '已清除默认选择',
+        sshGroup: 'SSH 远程',
+        sshProbing: '正在探测 SSH 主机…',
+        sshUnconfigured: '~/.ssh/config 未配置主机',
+        sshEmpty: 'SSH 主机可达，但未发现 Python',
+        sshError: 'SSH 主机不可达或探测失败',
+        sshUnavailable: '本机没有可用的 ssh 客户端',
       },
     }
 
@@ -114,6 +127,8 @@ window.__ModuleLoader__.load({
 .pem-row:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:-1px}
 .pem-row:disabled,.pem-row[aria-disabled='true']{cursor:default;opacity:.6}
 .pem-row-current{background:var(--dsw-alias-bg-layer-1);border-color:var(--dsw-alias-border-l2)}
+.pem-group{padding:8px 8px 2px;font-size:11px;font-weight:600;line-height:15px;color:var(--dsw-alias-label-secondary)}
+.pem-row-static{display:flex;align-items:center;gap:8px;box-sizing:border-box;width:100%;min-width:0;margin:0;padding:7px 8px;border:1px dashed var(--dsw-alias-border-l2);border-radius:9px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;text-align:left;cursor:default;opacity:.75}
 .pem-row-main{display:flex;flex-direction:column;gap:1px;flex:1 1 auto;min-width:0}
 .pem-row-name{display:flex;align-items:center;gap:6px;min-width:0;font-size:12px;font-weight:600;line-height:16px;color:var(--dsw-alias-label-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .pem-badge{flex:none;padding:0 5px;border:1px solid var(--dsw-alias-border-l2);border-radius:999px;font-size:10px;font-weight:500;line-height:14px;color:var(--dsw-alias-label-secondary);text-transform:lowercase}
@@ -182,6 +197,14 @@ window.__ModuleLoader__.load({
 
     function shortFromPath(value) {
       if (typeof value !== 'string' || value === '') return ''
+      if (/^ssh:\/\//i.test(value)) {
+        const rest = value.slice(6)
+        const slash = rest.indexOf('/')
+        const target = slash >= 0 ? rest.slice(0, slash) : rest
+        const file = slash >= 0 ? (rest.slice(slash + 1).split('/').filter(Boolean).pop() || '') : ''
+        const fileBase = file.replace(/\.(exe|cmd|bat|ps1)$/i, '')
+        return fileBase ? target + ' · ' + fileBase : target
+      }
       const parts = value.split(/[\\/]+/).filter(Boolean)
       let base = parts.length > 0 ? parts[parts.length - 1] : value
       base = base.replace(/\.(exe|cmd|bat|ps1)$/i, '')
@@ -222,9 +245,20 @@ window.__ModuleLoader__.load({
       return fallback === undefined ? null : fallback
     }
 
-    async function requestJson(t, method, route, body) {
+    /** `payload.ssh` → { status, environments }; absent ssh keeps the last state. */
+    function normalizeSsh(payload) {
+      const ssh = payload && typeof payload.ssh === 'object' && payload.ssh !== null ? payload.ssh : null
+      if (!ssh) return null
+      return {
+        status: typeof ssh.status === 'string' ? ssh.status : 'idle',
+        environments: normalizeEnvironments({ environments: ssh.environments }),
+      }
+    }
+
+    async function requestJson(t, method, route, body, timeoutMs) {
+      const limit = typeof timeoutMs === 'number' && timeoutMs > 0 ? timeoutMs : REQUEST_TIMEOUT
       const controller = typeof AbortController === 'function' ? new AbortController() : null
-      const timer = controller ? window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT) : null
+      const timer = controller ? window.setTimeout(() => controller.abort(), limit) : null
       try {
         const init = { method, credentials: 'same-origin', headers: { Accept: 'application/json' } }
         if (body !== undefined) {
@@ -312,6 +346,8 @@ window.__ModuleLoader__.load({
         sessionId: session,
         phase: hasSession ? 'idle' : 'no-session',
         environments: [],
+        sshStatus: 'idle',
+        sshEnvironments: [],
         selected: null,
         error: '',
         actionError: '',
@@ -325,6 +361,7 @@ window.__ModuleLoader__.load({
       let triggerEl = null
       let panelEl = null
       let noticeTimer = null
+      let sshFetching = false
 
       function publish(patch) {
         if (disposed) return
@@ -409,18 +446,46 @@ window.__ModuleLoader__.load({
         }
       }
 
+      /** Ask the server for SSH remote environments (cached server-side). */
+      async function fetchSsh(force) {
+        if (!hasSession || disposed) return
+        if (sshFetching) return
+        sshFetching = true
+        try {
+          const payload = await requestJson(
+            t,
+            'GET',
+            '/ssh?sessionId=' + encodeURIComponent(session) + (force ? '&force=1' : ''),
+            undefined,
+            SSH_TIMEOUT,
+          )
+          const ssh = normalizeSsh(payload)
+          if (ssh) publish({ sshStatus: ssh.status, sshEnvironments: ssh.environments })
+        } catch (error) {
+          // An older host without the /ssh route must not fake an SSH failure.
+          const message = error && typeof error.message === 'string' ? error.message : ''
+          if (/unknown route/i.test(message)) return
+          publish({ sshStatus: 'error', sshEnvironments: [] })
+        } finally {
+          sshFetching = false
+        }
+      }
+
       async function load() {
         if (!hasSession || disposed) return
         if (snapshot.phase === 'loading') return
         publish({ phase: 'loading', error: '' })
         try {
           const payload = await requestJson(t, 'GET', '/state?sessionId=' + encodeURIComponent(session))
+          const ssh = normalizeSsh(payload)
           publish({
             phase: 'ready',
             environments: normalizeEnvironments(payload),
+            ...(ssh ? { sshStatus: ssh.status, sshEnvironments: ssh.environments } : {}),
             selected: selectedOf(payload),
             error: '',
           })
+          if (ssh && ssh.status === 'probing') fetchSsh(false)
         } catch (error) {
           publish({ phase: 'error', error: describe(error) })
         }
@@ -431,10 +496,15 @@ window.__ModuleLoader__.load({
         if (snapshot.phase === 'loading' || snapshot.busy) return
         publish({ phase: 'loading', error: '' })
         try {
-          const payload = await requestJson(t, 'POST', '/refresh', { sessionId: session })
+          const [payload] = await Promise.all([
+            requestJson(t, 'POST', '/refresh', { sessionId: session }, SSH_TIMEOUT),
+            fetchSsh(true),
+          ])
+          const ssh = normalizeSsh(payload)
           publish({
             phase: 'ready',
             environments: normalizeEnvironments(payload),
+            ...(ssh ? { sshStatus: ssh.status, sshEnvironments: ssh.environments } : {}),
             selected: selectedOf(payload),
             error: '',
           })
@@ -450,7 +520,9 @@ window.__ModuleLoader__.load({
         try {
           const payload = await requestJson(t, 'POST', '/select', { sessionId: session, path })
           const chosen = selectedOf(payload, path)
-          const env = snapshot.environments.find(row => row.path === chosen) || null
+          const env = snapshot.environments.find(row => row.path === chosen)
+            || snapshot.sshEnvironments.find(row => row.path === chosen)
+            || null
           const label = env ? env.name : shortFromPath(chosen || path)
           publish({
             busy: false,
@@ -664,8 +736,12 @@ window.__ModuleLoader__.load({
       }, [])
 
       const environments = Array.isArray(snap.environments) ? snap.environments : []
+      const sshEnvironments = Array.isArray(snap.sshEnvironments) ? snap.sshEnvironments : []
+      const sshStatus = typeof snap.sshStatus === 'string' ? snap.sshStatus : 'idle'
       const selected = typeof snap.selected === 'string' && snap.selected !== '' ? snap.selected : null
-      const selectedEnv = selected === null ? null : environments.find(env => env.path === selected) || null
+      const selectedEnv = selected === null
+        ? null
+        : environments.find(env => env.path === selected) || sshEnvironments.find(env => env.path === selected) || null
       const shortName = selected === null ? '' : (selectedEnv ? selectedEnv.name : shortFromPath(selected))
       const loading = snap.phase === 'loading'
       const busy = snap.busy === true
@@ -763,6 +839,41 @@ window.__ModuleLoader__.load({
           tabIndex: index === focusIndex ? 0 : -1,
           onChoose: (path) => store.choose(path),
         }))))
+      }
+      // SSH remote environments live in their own group: a static, disabled
+      // row explains why the option is unavailable when nothing is selectable.
+      const showSshSection = snap.phase === 'ready'
+        && ['probing', 'ready', 'unconfigured', 'empty', 'error', 'unavailable'].includes(sshStatus)
+      if (showSshSection) {
+        const sshRows = sshStatus === 'ready' ? sshEnvironments : []
+        listBody.push(h('div', { className: 'pem-group', key: 'ssh-group' }, t('sshGroup')))
+        if (sshRows.length > 0) {
+          const sshFocus = Math.max(0, sshRows.findIndex(env => env.path === selected))
+          listBody.push(h('div', {
+            className: 'pem-list',
+            key: 'ssh-list',
+            role: 'radiogroup',
+            'aria-label': t('sshGroup'),
+            onKeyDown: (event) => rowKeyDown(event, (index) => {
+              const env = sshRows[index]
+              if (env) store.choose(env.path)
+            }),
+          }, sshRows.map((env, index) => environmentRow({
+            env,
+            checked: env.path === selected,
+            busy,
+            tabIndex: index === sshFocus ? 0 : -1,
+            onChoose: (path) => store.choose(path),
+          }))))
+        } else {
+          const sshStaticText = sshStatus === 'probing' ? t('sshProbing')
+            : sshStatus === 'unconfigured' ? t('sshUnconfigured')
+            : sshStatus === 'empty' ? t('sshEmpty')
+            : sshStatus === 'unavailable' ? t('sshUnavailable')
+            : t('sshError')
+          listBody.push(h('div', { className: 'pem-row-static', key: 'ssh-static', 'aria-disabled': 'true' },
+            h('span', { className: 'pem-row-main' }, h('span', { className: 'pem-row-name' }, sshStaticText))))
+        }
       }
       children.push(h('div', { className: 'pem-body', key: 'body' }, listBody))
 

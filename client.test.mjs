@@ -200,15 +200,19 @@ function sessionOfRequest(url, init) {
 }
 
 /** Fake API that keeps one selected path per sessionId and records requests. */
-function installSessionApi() {
+function installSessionApi({ stateSsh, sshState } = {}) {
   const calls = []
   const selections = new Map()
+  const defaultSsh = { status: 'unconfigured', environments: [] }
   globalThis.fetch = async (url, init = {}) => {
     const text = String(url)
     calls.push({ url: text, init })
     const session = sessionOfRequest(text, init)
     if (text.startsWith('/python-env/api/state')) {
-      return jsonResponse({ ok: true, sessionId: session, selected: selections.get(session) ?? null, environments: ENVIRONMENTS })
+      return jsonResponse({ ok: true, sessionId: session, selected: selections.get(session) ?? null, environments: ENVIRONMENTS, ssh: stateSsh ?? defaultSsh })
+    }
+    if (text.startsWith('/python-env/api/ssh')) {
+      return jsonResponse({ ok: true, sessionId: session, ssh: sshState ?? stateSsh ?? defaultSsh })
     }
     if (text === '/python-env/api/select') {
       const body = JSON.parse(init.body)
@@ -222,7 +226,7 @@ function installSessionApi() {
     }
     if (text === '/python-env/api/refresh') {
       const body = JSON.parse(init.body)
-      return jsonResponse({ ok: true, sessionId: body.sessionId, selected: selections.get(body.sessionId) ?? null, environments: ENVIRONMENTS })
+      return jsonResponse({ ok: true, sessionId: body.sessionId, selected: selections.get(body.sessionId) ?? null, environments: ENVIRONMENTS, ssh: sshState ?? stateSsh ?? defaultSsh })
     }
     throw new Error('unexpected request ' + text)
   }
@@ -595,6 +599,96 @@ test('Tab focus stays inside the dialog', async () => {
     fakeReact.setRefElement(null)
     document.activeElement = null
   }
+})
+
+const SSH_ENVIRONMENTS = [
+  { name: 'probe-box:2222', prefix: 'ssh://deploy@probe-box:2222', path: 'ssh://deploy@probe-box:2222/usr/bin/python3', source: 'ssh' },
+]
+
+test('the SSH remote section lists probed interpreters and selects one over the API', async () => {
+  const api = installSessionApi({
+    stateSsh: { status: 'ready', environments: SSH_ENVIRONMENTS },
+    sshState: { status: 'ready', environments: SSH_ENVIRONMENTS },
+  })
+  const injected = spec.inject('session-ssh')
+  const { panel } = await openPanel('ssh-1', injected)
+  const caption = findByClass(panel, 'pem-group')
+  assert.ok(caption, 'the SSH section has a caption')
+  assert.equal(textOf(caption), 'SSH remote')
+  const sshGroups = collect(panel).filter(node => node.props && node.props.role === 'radiogroup')
+  assert.equal(sshGroups.length, 2, 'local and ssh rows live in separate groups')
+  const sshGroup = sshGroups[1]
+  assert.equal(sshGroup.props['aria-label'], 'SSH remote')
+  assert.equal(sshGroup.children.length, 1)
+  const sshRow = sshGroup.children[0]
+  assert.equal(sshRow.props.role, 'radio')
+  assert.equal(sshRow.props['aria-checked'], false)
+  const badge = collect(sshRow).find(node => node.props && node.props.className === 'pem-badge')
+  assert.equal(badge.children[0], 'ssh')
+  assert.equal(findByClass(panel, 'pem-row-static'), undefined, 'no static row when ssh environments exist')
+
+  sshRow.props.onClick()
+  await flush()
+  const select = api.calls.find(call => call.url === '/python-env/api/select')
+  assert.ok(select, 'selecting an ssh row posts the ssh:// path')
+  assert.deepEqual(JSON.parse(select.init.body), { sessionId: 'session-ssh', path: SSH_ENVIRONMENTS[0].path })
+  const reopened = render('ssh-1', injected)
+  const panel2 = portals[0].node
+  const groups2 = collect(panel2).filter(node => node.props && node.props.role === 'radiogroup')
+  assert.equal(groups2[1].children[0].props['aria-checked'], true)
+  assert.ok(textOf(findByClass(panel2, 'pem-current')).includes('probe-box:2222'))
+})
+
+test('an unavailable SSH section stays visible but unselectable', async () => {
+  const api = installSessionApi({ stateSsh: { status: 'unconfigured', environments: [] } })
+  const injected = spec.inject('session-ssh-off')
+  const { panel } = await openPanel('ssh-2', injected)
+  assert.equal(api.calls.filter(call => call.url.startsWith('/python-env/api/ssh')).length, 0,
+    'no /ssh call when the state already reports unconfigured')
+  const staticRow = findByClass(panel, 'pem-row-static')
+  assert.ok(staticRow, 'the unavailable option renders as a static row')
+  assert.equal(staticRow.props['aria-disabled'], 'true')
+  assert.equal(staticRow.props.onClick, undefined, 'the static row has no click handler')
+  assert.ok(textOf(staticRow).includes('No hosts configured in ~/.ssh/config'))
+  assert.equal(collect(panel).filter(node => node.props && node.props.role === 'radiogroup').length, 1,
+    'only the local list is a radiogroup when ssh has no rows')
+})
+
+test('a probing SSH state resolves through the /ssh follow-up request', async () => {
+  const calls = []
+  let releaseSsh = null
+  globalThis.fetch = (url, init = {}) => {
+    const text = String(url)
+    calls.push({ url: text, init })
+    if (text.startsWith('/python-env/api/state')) {
+      return Promise.resolve(jsonResponse({
+        ok: true, sessionId: 'session-ssh-probe', selected: null,
+        environments: ENVIRONMENTS, ssh: { status: 'probing', environments: [] },
+      }))
+    }
+    if (text.startsWith('/python-env/api/ssh')) {
+      return new Promise(resolve => {
+        releaseSsh = () => resolve(jsonResponse({
+          ok: true, sessionId: 'session-ssh-probe', ssh: { status: 'ready', environments: SSH_ENVIRONMENTS },
+        }))
+      })
+    }
+    throw new Error('unexpected request ' + text)
+  }
+  const injected = spec.inject('session-ssh-probe')
+  const { panel } = await openPanel('ssh-3', injected)
+  assert.ok(textOf(findByClass(panel, 'pem-row-static')).includes('Probing SSH hosts…'))
+  assert.equal(calls.filter(call => call.url.startsWith('/python-env/api/ssh')).length, 1,
+    'the panel follows up with GET /ssh while probing')
+  assert.equal(releaseSsh !== null, true, 'the /ssh request is pending until released')
+  releaseSsh()
+  await flush()
+  const reopened = render('ssh-3', injected)
+  const panel2 = portals[0].node
+  const groups = collect(panel2).filter(node => node.props && node.props.role === 'radiogroup')
+  assert.equal(groups.length, 2, 'the section switches to selectable rows once probing finishes')
+  assert.equal(groups[1].children[0].props['aria-checked'], false)
+  assert.equal(findByClass(panel2, 'pem-row-static'), undefined)
 })
 
 test('Escape closes the open panel and disposal removes the global listeners', async () => {

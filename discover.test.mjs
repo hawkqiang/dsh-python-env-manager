@@ -61,3 +61,33 @@ test('discover({cwd}) finds a venv under the specified project directory', async
   await fs.writeFile(path.join(prefix,'pyvenv.cfg'),'');
   assert.deepEqual((await discover({cwd})).find(row => row.prefix === prefix),{prefix,path:executable,name:'.venv',source:'venv'});
 });
+
+test('Termux prefix discovery: explicit prefix, $PREFIX, and the android fallback', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(),'pem-termux-'));
+  t.after(() => fs.rm(root,{recursive:true,force:true}));
+  const usr = path.join(root,'data','data','com.termux','files','usr');
+  await fs.mkdir(path.join(usr,'bin'),{recursive:true});
+  const python = path.join(usr,'bin','python3');
+  await fs.writeFile(python,'stub');
+
+  // 1) Explicit override (test fixture).
+  const explicit = await discover({ platform:'android', cwd:root, home:root, termuxPrefix:usr });
+  assert.deepEqual(explicit.map(r => [r.path,r.name,r.source]), [[python,'termux','termux']]);
+
+  // 2) A Termux PREFIX environment variable is honored.
+  const fromEnv = await discover({ platform:'linux', cwd:root, home:root, env:{ PREFIX:usr } });
+  assert.deepEqual(fromEnv.map(r => [r.path,r.name,r.source]), [[python,'termux','termux']]);
+
+  // 3) platform 'android' falls back to the fixed Termux layout; the path
+  //    usually does not exist in the test sandbox, so discovery stays quiet.
+  const fallback = await discover({ platform:'android', cwd:root, home:root });
+  assert.deepEqual(fallback, []);
+
+  // 4) A real android PATH also contains the Termux prefix; it must not
+  //    produce a duplicate "usr"/PATH row next to the explicit termux source.
+  const withPath = await discover({
+    platform:'android', cwd:root, home:root, termuxPrefix:usr,
+    env:{ PATH:'/data/data/com.termux/files/usr/bin' },
+  });
+  assert.deepEqual(withPath.map(r => [r.path,r.name,r.source]), [[python,'termux','termux']]);
+});

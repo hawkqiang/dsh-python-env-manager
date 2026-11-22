@@ -1,14 +1,14 @@
 {
   "name": "@local/python-env-manager",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "license": "MIT",
-  "description": "Pick a Python interpreter per conversation from the DSH input toolbar; the conversation and its subagents run Python with it, without changing system PATH.",
+  "description": "Pick a Python interpreter per conversation from the DSH input toolbar; the conversation and its subagents run Python with it, without changing system PATH. Local discovery covers conda, venv, PATH, and Termux; SSH remote interpreters from ~/.ssh/config hosts are offered too and stay unselectable when none are reachable.",
   "type": "module",
   "exports": { ".": "./index.mjs", "./client": "./client.js", "./locale/*.json": "./locale/*.json", "./icon": "./icon.svg" },
-  "files": ["index.mjs", "discover.mjs", "client.js", "cordis.patch.yml", "locale/*.json", "icon.svg", "README.md", "LICENSE"],
+  "files": ["index.mjs", "discover.mjs", "ssh.mjs", "client.js", "cordis.patch.yml", "locale/*.json", "icon.svg", "README.md", "LICENSE"],
   "engines": { "dsh": ">=0.2.2-rc.5 <0.3.0" },
-  "scripts": { "test": "node discover.test.mjs && node host.test.mjs && node client.test.mjs" },
+  "scripts": { "test": "node discover.test.mjs && node ssh.test.mjs && node host.test.mjs && node client.test.mjs" },
   "dsh": {
     "bundle": { "patch": "./cordis.patch.yml" },
     "client": {

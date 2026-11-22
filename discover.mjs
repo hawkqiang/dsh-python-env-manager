@@ -5,7 +5,7 @@ import path from 'node:path';
 const isFile = async p => (await fs.stat(p).catch(() => null))?.isFile();
 
 /** Inspect filesystem metadata only. The first (most specific) source wins. */
-export async function discover({ env = process.env, cwd = process.cwd(), home = os.homedir(), platform = process.platform } = {}) {
+export async function discover({ env = process.env, cwd = process.cwd(), home = os.homedir(), platform = process.platform, termuxPrefix: termuxPrefixExplicit = null } = {}) {
   const windows = platform === 'win32';
   const exe = windows ? ['python.exe'] : ['python3', 'python'];
   const vars = windows ? Object.fromEntries(Object.entries(env).map(([k,v]) => [k.toUpperCase(),v])) : env;
@@ -24,6 +24,13 @@ export async function discover({ env = process.env, cwd = process.cwd(), home = 
   }
   const venv = prefix => add(prefix, 'venv', [path.join(prefix, windows ? 'Scripts' : 'bin')]);
   const conda = (prefix, name) => add(prefix, 'conda', [windows ? prefix : path.join(prefix,'bin')], exe, name);
+  // Termux (Android): Node on Termux reports platform 'android' and the shell
+  // exports PREFIX=/data/data/com.termux/files/usr. Honor an explicit prefix
+  // (also lets tests point at a fixture) and fall back to the fixed layout.
+  const termuxPrefix = termuxPrefixExplicit
+    ?? (typeof vars.PREFIX === 'string' && vars.PREFIX.includes('com.termux') ? vars.PREFIX : null)
+    ?? (platform === 'android' ? '/data/data/com.termux/files/usr' : null);
+  if (termuxPrefix) await add(termuxPrefix, 'termux', [path.join(termuxPrefix,'bin')], exe, 'termux');
   if (vars.VIRTUAL_ENV) await venv(vars.VIRTUAL_ENV);
   if (vars.CONDA_PREFIX) await conda(vars.CONDA_PREFIX, vars.CONDA_DEFAULT_ENV);
   for (const prefix of [cwd, path.join(cwd,'.venv'), path.join(cwd,'venv')]) {

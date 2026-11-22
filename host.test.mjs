@@ -94,15 +94,16 @@ function fakeCtx({
         throw new Error('spawn must not be called in these tests')
       },
     },
+    // DSH exposes injected services as ctx properties. webServer must come from
+    // `inject`, so the fake mirrors the real contract: ctx.webServer exists and
+    // ctx.get('webServer') deliberately does not.
+    webServer: {
+      register(route) {
+        record.routes.push(route)
+        return () => {}
+      },
+    },
     get(name) {
-      if (name === 'webServer') {
-        return {
-          register(route) {
-            record.routes.push(route)
-            return () => {}
-          },
-        }
-      }
       if (name === 'sandbox') return sandbox
       if (name === 'subagents') return subagents
       return undefined
@@ -156,7 +157,7 @@ test('apply registers both tools, the prompt section, shell env, and the prefix 
   const { ctx, record } = fakeCtx()
   apply(ctx)
 
-  assert.deepEqual(inject, ['tools', 'systemPrompt', 'shellEnv', 'workingDirectory', 'sandboxPolicy', 'subprocess'])
+  assert.deepEqual(inject, ['tools', 'systemPrompt', 'shellEnv', 'workingDirectory', 'sandboxPolicy', 'subprocess', 'webServer'])
   assert.deepEqual([...record.tools.keys()].sort(), ['python_env_manager', 'python_env_run'])
 
   const manager = record.tools.get('python_env_manager')
@@ -504,4 +505,149 @@ test('workspace-write without a sandbox service fails closed for a selected conv
     record.tools.get('python_env_run').execute({ argv: ['-V'] }, executionContext('session-fail-closed')),
     /沙箱/,
   )
+})
+
+/** A throwaway home directory whose ~/.ssh/config declares one reachable host. */
+async function useSshHomeFixture(t, { hosts = ['Host probe-box\n  HostName 192.0.2.10\n  User deploy\n  Port 2222\n  IdentityFile ~/.ssh/probe_key\n'] } = {}) {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), 'pem-ssh-home-'))
+  t.after(async () => {
+    if (process.env.DSH_PYTHON_ENV_MANAGER_HOME === home) delete process.env.DSH_PYTHON_ENV_MANAGER_HOME
+    await fs.rm(home, { recursive: true, force: true })
+  })
+  await fs.mkdir(path.join(home, '.ssh'), { recursive: true })
+  await fs.writeFile(path.join(home, '.ssh', 'config'), hosts.join('\n'), 'utf8')
+  process.env.DSH_PYTHON_ENV_MANAGER_HOME = home
+  return home
+}
+
+/** Fake ctx.subprocess.spawn that answers ssh probe/run calls with canned output. */
+function sshSpawnRecorder({ stdout = '', exitCode = 0 } = {}) {
+  const calls = []
+  return {
+    calls,
+    spawn(request) {
+      calls.push(request)
+      const isSsh = request.argv[0] === 'ssh'
+      const text = isSsh ? stdout : ''
+      return {
+        done: Promise.resolve({ exitCode, signal: null }),
+        terminate() {},
+        collected: {
+          stdout: { readFrom() { return { text, lossy: false } } },
+          stderr: { readFrom() { return { text: '', lossy: false } } },
+        },
+      }
+    },
+  }
+}
+
+test('ssh:// selections persist, resolve, and execute over ssh with quoted argv', async t => {
+  const stateFile = await useTemporaryStateFile(t)
+  await useSshHomeFixture(t)
+  const uri = 'ssh://deploy@probe-box:2222/usr/bin/python3'
+  const spawn = sshSpawnRecorder({ stdout: 'ok' })
+  const { ctx, record } = fakeCtx({ mode: 'danger-full-access', spawn: spawn.spawn })
+  apply(ctx)
+  const manager = record.tools.get('python_env_manager')
+  const runner = record.tools.get('python_env_run')
+
+  await assert.rejects(
+    manager.execute({ action: 'select', path: 'ssh://probe-box/usr/bin/bash' }, executionContext('session-ssh')),
+    /SSH 解释器路径无效/,
+  )
+  await assert.rejects(
+    manager.execute({ action: 'select', path: 'ssh://probe-box:not-a-port/usr/bin/python3' }, executionContext('session-ssh')),
+    /SSH 解释器路径无效/,
+  )
+  await assert.rejects(
+    manager.execute({ action: 'select', path: 'ssh:///usr/bin/python3' }, executionContext('session-ssh')),
+    /SSH 解释器路径无效/,
+  )
+
+  const selected = await manager.execute({ action: 'select', path: 'ssh://deploy@probe-box:2222/usr/bin/python3' }, executionContext('session-ssh'))
+  assert.equal(selected.status, 'selected')
+  assert.equal(selected.selected, uri)
+  assert.equal(selected.environment.name, 'probe-box:2222')
+  assert.equal(selected.environment.source, 'ssh')
+  assert.deepEqual(JSON.parse(await fs.readFile(stateFile, 'utf8')), {
+    version: 2,
+    sessions: { 'session-ssh': uri },
+  })
+
+  const resolved = await manager.execute({ action: 'resolve' }, executionContext('session-ssh'))
+  assert.equal(resolved.executable, uri)
+
+  const result = await runner.execute({ argv: ['-c', 'print(1)'] }, executionContext('session-ssh'))
+  assert.equal(result.interpreter, uri)
+  assert.equal(result.exitCode, 0)
+  assert.equal(spawn.calls.length, 1, 'python_env_run must spawn exactly one ssh process')
+  assert.deepEqual(spawn.calls[0].argv, [
+    'ssh',
+    '-o', 'BatchMode=yes',
+    '-o', 'ConnectTimeout=8',
+    '-p', '2222',
+    'deploy@probe-box',
+    `'/usr/bin/python3' '-c' 'print(1)'`,
+  ])
+})
+
+test('the /ssh endpoint probes ~/.ssh/config hosts and the panel state carries the result', async t => {
+  await useTemporaryStateFile(t)
+  await useSshHomeFixture(t)
+  const spawn = sshSpawnRecorder({ stdout: '/usr/bin/python3\n/usr/bin/python3.12\n' })
+  const { ctx, record } = fakeCtx({ mode: 'danger-full-access', spawn: spawn.spawn })
+  apply(ctx)
+  const route = record.routes[0]
+  const manager = record.tools.get('python_env_manager')
+
+  const state = await callRoute(route, 'GET', stateUrl('session-ssh-panel'))
+  assert.equal(state.status, 200)
+  assert.ok(['probing', 'ready'].includes(state.body.ssh.status), `unexpected ssh status ${state.body.ssh.status}`)
+
+  const ssh = await callRoute(route, 'GET', `${API_PREFIX}/ssh?sessionId=${encodeURIComponent('session-ssh-panel')}`)
+  assert.equal(ssh.status, 200)
+  assert.equal(ssh.body.ssh.status, 'ready')
+  assert.deepEqual(ssh.body.ssh.environments.map(row => row.path), [
+    'ssh://deploy@probe-box:2222/usr/bin/python3',
+    'ssh://deploy@probe-box:2222/usr/bin/python3.12',
+  ])
+  assert.deepEqual(ssh.body.ssh.environments.map(row => row.source), ['ssh', 'ssh'])
+
+  const select = await callRoute(route, 'POST', `${API_PREFIX}/select`, {
+    sessionId: 'session-ssh-panel',
+    path: 'ssh://deploy@probe-box:2222/usr/bin/python3',
+  })
+  assert.equal(select.status, 200)
+  assert.equal(select.body.selected, 'ssh://deploy@probe-box:2222/usr/bin/python3')
+
+  const list = await manager.execute({ action: 'list' }, executionContext('session-ssh-panel'))
+  assert.equal(list.ssh.status, 'ready')
+  assert.equal(list.ssh.environments.length, 2)
+  assert.ok(list.environments.every(row => !row.path.startsWith('ssh://')), 'local rows never mix with ssh rows')
+
+  const refresh = await callRoute(route, 'POST', `${API_PREFIX}/refresh`, { sessionId: 'session-ssh-panel' })
+  assert.equal(refresh.body.ssh.status, 'ready')
+})
+
+test('unreachable or unconfigured ssh setups degrade to non-selectable statuses', async t => {
+  await useTemporaryStateFile(t)
+
+  // An empty ~/.ssh → unconfigured, and ssh is never spawned.
+  await useSshHomeFixture(t, { hosts: [] })
+  const quietSpawn = sshSpawnRecorder()
+  const quiet = fakeCtx({ mode: 'danger-full-access', spawn: quietSpawn.spawn })
+  apply(quiet.ctx)
+  const quietSsh = await callRoute(quiet.record.routes[0], 'GET', `${API_PREFIX}/ssh?sessionId=s1`)
+  assert.equal(quietSsh.body.ssh.status, 'unconfigured')
+  assert.deepEqual(quietSsh.body.ssh.environments, [])
+  assert.equal(quietSpawn.calls.length, 0)
+
+  // Hosts configured but unreachable → error status with no rows.
+  await useSshHomeFixture(t)
+  const failingSpawn = sshSpawnRecorder({ exitCode: 255 })
+  const failing = fakeCtx({ mode: 'danger-full-access', spawn: failingSpawn.spawn })
+  apply(failing.ctx)
+  const failingSsh = await callRoute(failing.record.routes[0], 'GET', `${API_PREFIX}/ssh?sessionId=s2&force=1`)
+  assert.equal(failingSsh.body.ssh.status, 'error')
+  assert.deepEqual(failingSsh.body.ssh.environments, [])
 })

@@ -1,1 +1,1 @@
-{"meta":{"title":"Python 环境选择器","description":"从输入框工具栏按对话选择 Python 解释器，每个对话单独设置。选择仅作用于当前对话及其子代理，其他对话不受影响；不更改系统 PATH，也不安装软件。面板按完整路径列出已发现的 conda、venv 与 PATH 解释器。"}}
+{"meta":{"title":"Python 环境选择器","description":"从输入框工具栏按对话选择 Python 解释器，每个对话单独设置。选择仅作用于当前对话及其子代理，其他对话不受影响；不更改系统 PATH，也不安装软件。面板列出已发现的 conda、venv、PATH 与 Termux 解释器，并从 ~/.ssh/config 的主机探测 SSH 远程 Python（未配置或不可达时该项不可选）。"}}
